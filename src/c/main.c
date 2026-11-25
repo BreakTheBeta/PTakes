@@ -40,7 +40,7 @@
 #define CMD_COMMENT_REQUEST 9
 #define CMD_COMMENT_CHUNK   10
 
-#define BUILD_LABEL "v0.2"
+#define BUILD_LABEL "v0.3"
 /* @generated protocol:end */
 
 /* Pebble Time 2 (emery): 200 x 228. The chrome takes 18 top and 18 bottom and
@@ -77,11 +77,13 @@
 #define ERROR_TEXT_MAX 111
 
 /* Nothing on either screen moves at rest. The one timer in this app runs only
-   while a request is in flight, and it repaints a two-pixel rail rather than a
-   panel. Adding anything that has to animate when idle means a timer that never
+   while a request is in flight. It repaints the rail and the small matrix
+   reserved for a loading placeholder. Adding anything that has to animate when idle means a timer that never
    stops on a watch that is worn all day. */
 #define BUSY_TICK_MS 110
-#define RAIL_SWEEP_W 44
+#define ACTIVITY_Y 32
+#define ACTIVITY_W 112
+#define ACTIVITY_H 36
 
 #define BUSY_LIST 0x1
 #define BUSY_BODY 0x2
@@ -95,16 +97,22 @@ typedef struct {
 
 static Window *s_list_window;
 static Window *s_detail_window;
+static Window *s_actions_window;
 static MenuLayer *s_list_menu;
+static MenuLayer *s_actions_menu;
+static Layer *s_actions_chrome;
 static Layer *s_list_chrome;
 static Layer *s_list_rail;
 static ScrollLayer *s_detail_scroll;
 static Layer *s_detail_body;
 static Layer *s_detail_chrome;
 static Layer *s_detail_rail;
+static Layer *s_list_activity;
+static Layer *s_detail_activity;
 
 static GFont s_font_dot;
 static GFont s_font_author;
+static GFont s_font_dot_large;
 static GFont s_font_preview;
 static GFont s_font_body;
 
@@ -131,7 +139,7 @@ static char s_error[ERROR_TEXT_MAX];
 
 static uint8_t s_busy;
 static AppTimer *s_busy_timer;
-static int s_rail_phase;
+static uint32_t s_busy_started_ms;
 static bool s_focused = true;
 static time_t s_last_list;
 static bool s_listed_once;
@@ -148,7 +156,7 @@ static GColor band_ink(void) { return GColorWhite; }
 static GColor panel(void) { return GColorWhite; }
 static GColor ink(void) { return GColorBlack; }
 static GColor muted(void) { return GColorDarkGray; }
-static GColor accent(void) { return GColorJaegerGreen; }
+static GColor accent(void) { return GColorIslamicGreen; }
 
 /* The stripe down a row's left edge is the only place karma is shown at a
    glance, so it has to be legible against both the white row and the black
@@ -269,50 +277,141 @@ static const char *empty_text(void) {
 
 ///////////////////////////////////////////////////////////////////// chrome
 
+static uint32_t animation_clock_ms(void) {
+  time_t seconds;
+  uint16_t milliseconds;
+  time_ms(&seconds, &milliseconds);
+  return (uint32_t)seconds * 1000u + milliseconds;
+}
+
+static void draw_dot_rule(GContext *ctx, GRect bounds, GColor color) {
+  graphics_context_set_fill_color(ctx, color);
+  for (int x = bounds.origin.x; x + 1 < bounds.origin.x + bounds.size.w; x += 4) {
+    graphics_fill_rect(ctx, GRect(x, bounds.origin.y, 2, 1), 0, GCornerNone);
+  }
+}
+
+static void draw_matrix_label(GContext *ctx, GPoint at, const char *text, int pitch, GColor ink) {
+  static const uint8_t letters[26][5] = {
+    {2,5,7,5,5}, {6,5,6,5,6}, {3,4,4,4,3}, {6,5,5,5,6},
+    {7,4,6,4,7}, {7,4,6,4,4}, {3,4,5,5,3}, {5,5,7,5,5},
+    {7,2,2,2,7}, {1,1,1,5,2}, {5,5,6,5,5}, {4,4,4,4,7},
+    {5,7,7,5,5}, {5,7,7,7,5}, {2,5,5,5,2}, {6,5,6,4,4},
+    {2,5,5,7,3}, {6,5,6,5,5}, {3,4,2,1,6}, {7,2,2,2,2},
+    {5,5,5,5,7}, {5,5,5,5,2}, {5,5,7,7,5}, {5,5,2,5,5},
+    {5,5,2,2,2}, {7,1,2,4,7}
+  };
+  static const uint8_t digits[10][5] = {
+    {7,5,5,5,7}, {2,6,2,2,7}, {6,1,2,4,7}, {6,1,2,1,6}, {5,5,7,1,1},
+    {7,4,6,1,6}, {3,4,6,5,2}, {7,1,2,2,2}, {2,5,2,5,2}, {2,5,3,1,6}
+  };
+  static const uint8_t plus[5] = {0,2,7,2,0};
+  static const uint8_t minus[5] = {0,0,7,0,0};
+  graphics_context_set_fill_color(ctx, ink);
+  for (; *text; text++, at.x += 4 * pitch) {
+    const uint8_t *glyph = NULL;
+    if (*text >= 'A' && *text <= 'Z') glyph = letters[*text - 'A'];
+    if (*text >= '0' && *text <= '9') glyph = digits[*text - '0'];
+    if (*text == '+') glyph = plus;
+    if (*text == '-') glyph = minus;
+    if (!glyph) continue;
+    for (int row = 0; row < 5; row++) {
+      for (int column = 0; column < 3; column++) {
+        if (glyph[row] & (4 >> column)) {
+          graphics_fill_rect(ctx, GRect(at.x + column * pitch, at.y + row * pitch, pitch, pitch),
+                             0, GCornerNone);
+        }
+      }
+    }
+  }
+}
+
+static void draw_loading_matrix(GContext *ctx, GRect field, int row_pitch,
+                                GColor unlit, GColor lit) {
+  const int column_pitch = 4;
+  const int cycle_ms = 1320;
+  uint32_t elapsed = animation_clock_ms() - s_busy_started_ms;
+  int phase = elapsed % cycle_ms;
+  int columns = field.size.w / column_pitch;
+  int rows = field.size.h / row_pitch;
+  for (int row = 0; row < rows; row++) {
+    int row_distance = abs(2 * row + 1 - rows);
+    for (int column = 0; column < columns; column++) {
+      int column_distance = abs(2 * column + 1 - columns);
+      int stagger = ((row + column) % 3) * 32;
+      int reveal = row_distance <= 1
+        ? column_distance * 300 / columns
+        : 320 + row_distance * 290 / rows + column_distance * 70 / columns;
+      int clear = 850 + (columns - column_distance) * 180 / columns +
+                  (rows - row_distance) * 110 / rows;
+      bool visible = phase >= reveal + stagger && phase < clear + stagger;
+      graphics_context_set_fill_color(ctx, visible ? lit : unlit);
+      graphics_fill_rect(ctx, GRect(field.origin.x + column * column_pitch,
+                                    field.origin.y + row * row_pitch,
+                                    2, row_pitch == 1 ? 1 : 2), 0, GCornerNone);
+    }
+  }
+}
+
 static void draw_band(GContext *ctx, GRect band, const char *left, const char *right) {
   graphics_context_set_fill_color(ctx, chassis());
   graphics_fill_rect(ctx, band, 0, GCornerNone);
   graphics_context_set_text_color(ctx, band_ink());
-  if (left && left[0]) {
-    graphics_draw_text(ctx, left, s_font_dot,
-                       GRect(band.origin.x + PANEL_INSET, band.origin.y + 2,
-                             band.size.w - 2 * PANEL_INSET, BAND_HEIGHT),
-                       GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+  int width = band.size.w - 2 * PANEL_INSET;
+  int right_width = right && right[0] ? graphics_text_layout_get_content_size(
+    right, s_font_dot, GRect(0, 0, width, BAND_HEIGHT),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentRight).w : 0;
+  GRect text = GRect(band.origin.x + PANEL_INSET, band.origin.y + 1, width, BAND_HEIGHT);
+  if (left && left[0] && width > right_width + 6) {
+    GRect box = text;
+    if (right_width) box.size.w -= right_width + 6;
+    graphics_draw_text(ctx, left, s_font_dot, box, GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
   }
-  if (right && right[0]) {
-    graphics_draw_text(ctx, right, s_font_dot,
-                       GRect(band.origin.x + PANEL_INSET, band.origin.y + 2,
-                             band.size.w - 2 * PANEL_INSET, BAND_HEIGHT),
-                       GTextOverflowModeTrailingEllipsis, GTextAlignmentRight, NULL);
+  if (right_width) {
+    graphics_draw_text(ctx, right, s_font_dot, text, GTextOverflowModeTrailingEllipsis, GTextAlignmentRight, NULL);
   }
 }
 
-/* The accent rail under the top band doubles as the only progress indicator in
-   the app: a bright segment sweeps along it while the phone is working, and it
-   is a plain line the rest of the time. Reusing the rail rather than adding a
-   spinner is what keeps the busy repaint down to two pixel rows. */
 static void rail_update_proc(Layer *layer, GContext *ctx) {
   GRect bounds = layer_get_bounds(layer);
-  graphics_context_set_fill_color(ctx, accent());
+  graphics_context_set_fill_color(ctx, chassis());
   graphics_fill_rect(ctx, bounds, 0, GCornerNone);
-  if (!s_busy) {
-    return;
+  GRect rail = GRect(6, 0, bounds.size.w - 12, bounds.size.h);
+  if (s_busy) {
+    draw_loading_matrix(ctx, rail, 1, GColorDarkGray, GColorMintGreen);
+  } else {
+    draw_dot_rule(ctx, rail, GColorMintGreen);
   }
-  int span = bounds.size.w + RAIL_SWEEP_W;
-  int x = (s_rail_phase * 4) % span - RAIL_SWEEP_W;
-  graphics_context_set_fill_color(ctx, GColorWhite);
-  graphics_fill_rect(ctx, GRect(x, bounds.origin.y, RAIL_SWEEP_W, bounds.size.h),
-                     0, GCornerNone);
+}
+
+static void activity_update_proc(Layer *layer, GContext *ctx) {
+  GRect bounds = layer_get_bounds(layer);
+  graphics_context_set_fill_color(ctx, panel());
+  graphics_fill_rect(ctx, bounds, 0, GCornerNone);
+  draw_loading_matrix(ctx, bounds, 4, GColorLightGray, accent());
+}
+
+static void update_activity_layers(void) {
+  if (s_list_activity) {
+    bool hidden = s_take_count > 0 || !(s_busy & BUSY_LIST);
+    if (layer_get_hidden(s_list_activity) != hidden) layer_set_hidden(s_list_activity, hidden);
+  }
+  if (s_detail_activity) {
+    bool hidden = !(s_busy & BUSY_BODY);
+    if (layer_get_hidden(s_detail_activity) != hidden) layer_set_hidden(s_detail_activity, hidden);
+  }
 }
 
 static void busy_timer_callback(void *data) {
   s_busy_timer = NULL;
-  s_rail_phase++;
-  if (s_list_rail) {
+  Window *top = window_stack_get_top_window();
+  if (top == s_list_window && s_list_rail) {
     layer_mark_dirty(s_list_rail);
+    if (s_list_activity && !layer_get_hidden(s_list_activity)) layer_mark_dirty(s_list_activity);
   }
-  if (s_detail_rail) {
+  if (top == s_detail_window && s_detail_rail) {
     layer_mark_dirty(s_detail_rail);
+    if (s_detail_activity && !layer_get_hidden(s_detail_activity)) layer_mark_dirty(s_detail_activity);
   }
   update_busy_timer();
 }
@@ -335,6 +434,8 @@ static void set_busy(uint8_t flag, bool on) {
     s_busy &= ~flag;
   }
   if (before != s_busy) {
+    if (!before) s_busy_started_ms = animation_clock_ms();
+    update_activity_layers();
     if (s_list_rail) layer_mark_dirty(s_list_rail);
     if (s_detail_rail) layer_mark_dirty(s_detail_rail);
     update_busy_timer();
@@ -348,7 +449,9 @@ static void list_chrome_update_proc(Layer *layer, GContext *ctx) {
   GRect bounds = layer_get_bounds(layer);
 
   char position[12] = "";
-  if (s_take_count > 0) {
+  if (s_take_count > 0 && s_selected >= s_take_count) {
+    copy_text(position, sizeof(position), "OPTIONS");
+  } else if (s_take_count > 0) {
     snprintf(position, sizeof(position), "%d/%d",
              clamp_int(s_selected + 1, 1, MAX_TAKES), clamp_int(s_take_count, 1, MAX_TAKES));
   }
@@ -368,28 +471,32 @@ static void list_chrome_update_proc(Layer *layer, GContext *ctx) {
   sync_age_text(age, sizeof(age));
   draw_band(ctx, GRect(0, bounds.size.h - BOTTOM_CHROME, bounds.size.w, BAND_HEIGHT),
             left, age);
-  graphics_context_set_fill_color(ctx, accent());
-  graphics_fill_rect(ctx, GRect(0, bounds.size.h - RAIL_HEIGHT, bounds.size.w, RAIL_HEIGHT),
-                     0, GCornerNone);
+  draw_dot_rule(ctx, GRect(6, bounds.size.h - RAIL_HEIGHT, bounds.size.w - 12, 1), GColorMintGreen);
 }
 
 static uint16_t list_num_rows(MenuLayer *menu_layer, uint16_t section, void *data) {
   /* The empty list is one row rather than none so it can carry its own
      explanation and stay pressable -- SELECT on it retries. */
-  return s_take_count > 0 ? s_take_count : 1;
+  return s_take_count > 0 ? s_take_count + 1 : 1;
 }
 
 static int16_t list_cell_height(MenuLayer *menu_layer, MenuIndex *index, void *data) {
   if (s_take_count == 0 && s_list_menu) {
     return layer_get_bounds(menu_layer_get_layer(s_list_menu)).size.h;
   }
-  return ROW_HEIGHT;
+  return index->row == s_take_count ? 42 : ROW_HEIGHT;
 }
 
 static void list_draw_row(GContext *ctx, const Layer *cell, MenuIndex *index, void *data) {
   GRect bounds = layer_get_bounds(cell);
 
   if (s_take_count == 0) {
+    if (s_busy & BUSY_LIST) {
+      const char *label = "READING TAKES";
+      draw_matrix_label(ctx, GPoint((bounds.size.w - 8 * (int)strlen(label)) / 2,
+                                  ACTIVITY_Y + ACTIVITY_H + 10), label, 2, accent());
+      return;
+    }
     graphics_context_set_text_color(ctx, s_error[0] ? GColorDarkCandyAppleRed : ink());
     const char *message = empty_text();
     int height = text_height(message, s_font_preview, bounds.size.w - 2 * BODY_PAD);
@@ -406,35 +513,46 @@ static void list_draw_row(GContext *ctx, const Layer *cell, MenuIndex *index, vo
   }
 
   int row = index->row;
-  if (row < 0 || row >= s_take_count) {
+  if (row == s_take_count) {
+    draw_matrix_label(ctx, GPoint(ROW_GUTTER, 7), "OPTIONS", 2, ink());
+    graphics_context_set_text_color(ctx, ink());
+    graphics_draw_text(ctx, "Shuffle or refresh", s_font_preview,
+                       GRect(ROW_GUTTER, 20, bounds.size.w - 2 * ROW_GUTTER, 18),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
     return;
   }
+  if (row < 0 || row > s_take_count) return;
   const Take *take = &s_takes[row];
   bool selected = menu_layer_is_index_selected(s_list_menu, index);
-  GColor text_color = selected ? GColorWhite : ink();
-  GColor meta_color = selected ? GColorLightGray : muted();
-
+  GColor background = selected ? GColorCeleste : panel();
+  graphics_context_set_fill_color(ctx, background);
+  graphics_fill_rect(ctx, bounds, 0, GCornerNone);
   graphics_context_set_fill_color(ctx, karma_color(take->karma));
-  graphics_fill_rect(ctx, GRect(0, 0, STRIPE_W, bounds.size.h), 0, GCornerNone);
+  for (int y = 4; y < bounds.size.h - 2; y += 4) {
+    graphics_fill_rect(ctx, GRect(2, y, STRIPE_W, 2), 0, GCornerNone);
+  }
 
   int right = bounds.size.w - 6;
   int author_w = right - ROW_GUTTER - METER_W - 4;
-
-  graphics_context_set_text_color(ctx, text_color);
-  graphics_draw_text(ctx, take->author, s_font_author,
-                     GRect(ROW_GUTTER, -1, author_w, 22),
+  GFont author_font = s_font_author;
+  if (s_font_dot_large && strlen(take->author) <= (size_t)(author_w / 12) &&
+      strspn(take->author, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_- ") == strlen(take->author)) {
+    author_font = s_font_dot_large;
+  }
+  graphics_context_set_text_color(ctx, ink());
+  graphics_draw_text(ctx, take->author, author_font, GRect(ROW_GUTTER, -1, author_w, 22),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 
   char karma[KARMA_TEXT_MAX];
   karma_text(karma, sizeof(karma), take->karma);
-  graphics_context_set_text_color(ctx, meta_color);
-  graphics_draw_text(ctx, karma, s_font_dot, GRect(right - METER_W, 1, METER_W, 14),
+  draw_matrix_label(ctx, GPoint(right - 4 * (int)strlen(karma), 5), karma, 1, ink());
+  graphics_context_set_text_color(ctx, muted());
+  graphics_draw_text(ctx, take->age, s_font_dot, GRect(right - METER_W, 9, METER_W, 14),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentRight, NULL);
-  graphics_draw_text(ctx, take->age, s_font_dot, GRect(right - METER_W, 13, METER_W, 14),
-                     GTextOverflowModeTrailingEllipsis, GTextAlignmentRight, NULL);
-
+  draw_dot_rule(ctx, GRect(ROW_GUTTER, 22, right - ROW_GUTTER, 1), muted());
+  graphics_context_set_text_color(ctx, ink());
   graphics_draw_text(ctx, take->preview, s_font_preview,
-                     GRect(ROW_GUTTER, 23, right - ROW_GUTTER, 36),
+                     GRect(ROW_GUTTER, 25, right - ROW_GUTTER, 35),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 }
 
@@ -485,6 +603,10 @@ static void list_select(MenuLayer *menu_layer, MenuIndex *index, void *data) {
     request_refresh();
     return;
   }
+  if (index->row == s_take_count) {
+    window_stack_push(s_actions_window, true);
+    return;
+  }
   s_restore_take_offset = false;
   request_body(index->row);
   window_stack_push(s_detail_window, true);
@@ -493,45 +615,73 @@ static void list_select(MenuLayer *menu_layer, MenuIndex *index, void *data) {
 
 /////////////////////////////////////////////////////////////// action menu
 
-typedef enum {
-  ActionShuffle = 1,
-  ActionRefresh
-} ActionKind;
-
-static void action_menu_closed(ActionMenu *menu, const ActionMenuItem *performed,
-                               void *context) {
-  /* The second parameter is the performed item, not the root level, despite
-     what the SDK's doc comment says -- so the level has to come through
-     ActionMenuConfig.context for there to be anything to free. */
-  action_menu_hierarchy_destroy((const ActionMenuLevel *)context, NULL, NULL);
+static uint16_t actions_num_rows(MenuLayer *menu, uint16_t section, void *context) {
+  return 2;
 }
 
-static void perform_action(ActionMenu *menu, const ActionMenuItem *action, void *context) {
-  switch ((ActionKind)(uintptr_t)action_menu_item_get_action_data(action)) {
-    case ActionShuffle:
-      request_shuffle();
-      return;
-    case ActionRefresh:
-      request_refresh();
-      return;
+static int16_t actions_row_height(MenuLayer *menu, MenuIndex *index, void *context) {
+  return 52;
+}
+
+static void actions_draw_row(GContext *ctx, const Layer *cell, MenuIndex *index, void *context) {
+  GRect bounds = layer_get_bounds(cell);
+  bool selected = menu_layer_is_index_selected(s_actions_menu, index);
+  graphics_context_set_fill_color(ctx, selected ? GColorCeleste : panel());
+  graphics_fill_rect(ctx, bounds, 0, GCornerNone);
+  draw_matrix_label(ctx, GPoint(10, 9), index->row == 0 ? "SHUFFLE" : "REFRESH", 2, ink());
+  draw_dot_rule(ctx, GRect(10, 23, bounds.size.w - 20, 1), muted());
+  graphics_context_set_text_color(ctx, ink());
+  graphics_draw_text(ctx, index->row == 0 ? "Deal from saved takes" : "Get the latest takes",
+                     s_font_preview, GRect(10, 27, bounds.size.w - 20, 18),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+}
+
+static void actions_select(MenuLayer *menu, MenuIndex *index, void *context) {
+  window_stack_pop(true);
+  if (index->row == 0) {
+    request_shuffle();
+  } else {
+    request_refresh();
   }
+}
+
+static void actions_chrome_update_proc(Layer *layer, GContext *ctx) {
+  GRect bounds = layer_get_bounds(layer);
+  draw_band(ctx, GRect(0, 0, bounds.size.w, BAND_HEIGHT), "PTAKES", "OPTIONS");
+  draw_dot_rule(ctx, GRect(6, BAND_HEIGHT, bounds.size.w - 12, 1), GColorMintGreen);
+  draw_band(ctx, GRect(0, bounds.size.h - BAND_HEIGHT, bounds.size.w, BAND_HEIGHT), "SELECT", "BACK");
+}
+
+static void actions_window_load(Window *window) {
+  Layer *root = window_get_root_layer(window);
+  GRect bounds = layer_get_bounds(root);
+  window_set_background_color(window, chassis());
+  s_actions_menu = menu_layer_create(GRect(PANEL_INSET, TOP_CHROME,
+    bounds.size.w - 2 * PANEL_INSET, bounds.size.h - TOP_CHROME - BOTTOM_CHROME));
+  menu_layer_set_normal_colors(s_actions_menu, panel(), ink());
+  menu_layer_set_highlight_colors(s_actions_menu, GColorCeleste, ink());
+  menu_layer_set_callbacks(s_actions_menu, NULL, (MenuLayerCallbacks) {
+    .get_num_rows = actions_num_rows,
+    .get_cell_height = actions_row_height,
+    .draw_row = actions_draw_row,
+    .select_click = actions_select
+  });
+  menu_layer_set_click_config_onto_window(s_actions_menu, window);
+  layer_add_child(root, menu_layer_get_layer(s_actions_menu));
+  s_actions_chrome = layer_create(bounds);
+  layer_set_update_proc(s_actions_chrome, actions_chrome_update_proc);
+  layer_add_child(root, s_actions_chrome);
+}
+
+static void actions_window_unload(Window *window) {
+  if (s_actions_menu) menu_layer_destroy(s_actions_menu);
+  if (s_actions_chrome) layer_destroy(s_actions_chrome);
+  s_actions_menu = NULL;
+  s_actions_chrome = NULL;
 }
 
 static void list_select_long(MenuLayer *menu_layer, MenuIndex *index, void *data) {
-  ActionMenuLevel *level = action_menu_level_create(2);
-  if (!level) {
-    return;
-  }
-  action_menu_level_add_action(level, "Shuffle", perform_action, (void *)ActionShuffle);
-  action_menu_level_add_action(level, "Refresh", perform_action, (void *)ActionRefresh);
-  ActionMenuConfig config = (ActionMenuConfig) {
-    .root_level = level,
-    .context = level,
-    .colors = { .background = accent(), .foreground = GColorWhite },
-    .did_close = action_menu_closed,
-    .align = ActionMenuAlignCenter
-  };
-  action_menu_open(&config);
+  window_stack_push(s_actions_window, true);
 }
 
 
@@ -558,11 +708,19 @@ static const char *detail_text(void) {
   return s_body;
 }
 
+/* Replies carry two short metadata lines followed by a blank separator.
+   Keep the reading area proportional and give the metadata its own band. */
+static const char *reply_prose(const char *text) {
+  if (s_comment_page < 0 || s_error[0] || !detail_ready()) return NULL;
+  const char *separator = strstr(text, "\n\n");
+  return separator && strchr(text, '\n') < separator ? separator + 2 : NULL;
+}
+
 static int detail_content_height(int width) {
-  int height = text_height(detail_text(), s_font_body, width - 2 * BODY_PAD);
-  /* A short take must still fill the scroll view, or ScrollLayer has nothing to
-     clamp against and the view sits with its content floating. */
-  return clamp_int(height + 2 * BODY_PAD + 8, 120, 4000);
+  const char *text = detail_text();
+  const char *prose = reply_prose(text);
+  int height = text_height(prose ? prose : text, s_font_body, width - 2 * BODY_PAD);
+  return clamp_int(height + 2 * BODY_PAD + 8 + (prose ? 42 : 0), 120, 4000);
 }
 
 static void detail_resize(void) {
@@ -583,10 +741,48 @@ static void detail_body_update_proc(Layer *layer, GContext *ctx) {
   GRect bounds = layer_get_bounds(layer);
   graphics_context_set_fill_color(ctx, panel());
   graphics_fill_rect(ctx, bounds, 0, GCornerNone);
+  if (s_busy & BUSY_BODY) {
+    const char *label = s_comment_page >= 0 ? "READING REPLY" : "READING TAKE";
+    draw_matrix_label(ctx, GPoint((bounds.size.w - 8 * (int)strlen(label)) / 2,
+                                ACTIVITY_Y + ACTIVITY_H + 10), label, 2, accent());
+    return;
+  }
+
+  graphics_context_set_fill_color(ctx, accent());
+  for (int y = BODY_PAD; y < bounds.size.h - BODY_PAD; y += 4) {
+    graphics_fill_rect(ctx, GRect(3, y, 1, 2), 0, GCornerNone);
+  }
+  const char *text = detail_text();
+  const char *prose = reply_prose(text);
+  int y = BODY_PAD;
+  int width = bounds.size.w - 2 * BODY_PAD;
+  if (prose) {
+    const char *line_end = strchr(text, '\n');
+    char author[AUTHOR_MAX];
+    size_t author_len = (size_t)(line_end - text);
+    if (author_len >= sizeof(author)) author_len = sizeof(author) - 1;
+    memcpy(author, text, author_len);
+    author[author_len] = '\0';
+    trim_partial_utf8(author);
+    char metadata[64];
+    size_t metadata_len = (size_t)(prose - line_end - 3);
+    if (metadata_len >= sizeof(metadata)) metadata_len = sizeof(metadata) - 1;
+    memcpy(metadata, line_end + 1, metadata_len);
+    metadata[metadata_len] = '\0';
+    trim_partial_utf8(metadata);
+    graphics_context_set_text_color(ctx, ink());
+    graphics_draw_text(ctx, author, s_font_author, GRect(BODY_PAD, y - 4, width, 22),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+    graphics_context_set_text_color(ctx, muted());
+    graphics_draw_text(ctx, metadata, s_font_dot, GRect(BODY_PAD, y + 17, width, 13),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+    draw_dot_rule(ctx, GRect(BODY_PAD, y + 33, width, 1), muted());
+    y += 42;
+    text = prose;
+  }
   graphics_context_set_text_color(ctx, s_error[0] ? GColorDarkCandyAppleRed : ink());
-  graphics_draw_text(ctx, detail_text(), s_font_body,
-                     GRect(BODY_PAD, BODY_PAD, bounds.size.w - 2 * BODY_PAD,
-                           bounds.size.h - BODY_PAD),
+  graphics_draw_text(ctx, text, s_font_body,
+                     GRect(BODY_PAD, y, width, bounds.size.h - y),
                      GTextOverflowModeWordWrap, GTextAlignmentLeft, NULL);
 }
 
@@ -621,6 +817,7 @@ static void detail_chrome_update_proc(Layer *layer, GContext *ctx) {
   }
   draw_band(ctx, GRect(0, 0, bounds.size.w, BAND_HEIGHT), title, right);
   draw_band(ctx, GRect(0, bounds.size.h - BAND_HEIGHT, bounds.size.w, BAND_HEIGHT), action, back);
+  draw_dot_rule(ctx, GRect(6, bounds.size.h - BAND_HEIGHT, bounds.size.w - 12, 1), GColorMintGreen);
 }
 
 static void request_detail_page(int index, int page) {
@@ -868,6 +1065,7 @@ static void inbox_dropped_callback(AppMessageResult reason, void *context) {
   copy_text(s_error, sizeof(s_error), "Message dropped");
   set_busy(BUSY_LIST | BUSY_BODY, false);
   if (s_list_chrome) layer_mark_dirty(s_list_chrome);
+  detail_resize();
 }
 
 static void outbox_failed_callback(DictionaryIterator *iter, AppMessageResult reason,
@@ -876,6 +1074,7 @@ static void outbox_failed_callback(DictionaryIterator *iter, AppMessageResult re
   set_busy(BUSY_LIST | BUSY_BODY, false);
   if (s_list_menu) layer_mark_dirty(menu_layer_get_layer(s_list_menu));
   if (s_list_chrome) layer_mark_dirty(s_list_chrome);
+  detail_resize();
 }
 
 
@@ -891,6 +1090,16 @@ static void add_rail(Window *window, Layer **slot) {
   *slot = rail;
 }
 
+static void add_activity(Window *window, Layer **slot) {
+  *slot = layer_create(GRect((SCREEN_W - ACTIVITY_W) / 2, TOP_CHROME + ACTIVITY_Y,
+                             ACTIVITY_W, ACTIVITY_H));
+  if (*slot) {
+    layer_set_update_proc(*slot, activity_update_proc);
+    layer_add_child(window_get_root_layer(window), *slot);
+    update_activity_layers();
+  }
+}
+
 static void list_window_load(Window *window) {
   Layer *root = window_get_root_layer(window);
   GRect bounds = layer_get_bounds(root);
@@ -900,7 +1109,7 @@ static void list_window_load(Window *window) {
                      bounds.size.h - TOP_CHROME - BOTTOM_CHROME);
   s_list_menu = menu_layer_create(list);
   menu_layer_set_normal_colors(s_list_menu, panel(), ink());
-  menu_layer_set_highlight_colors(s_list_menu, ink(), panel());
+  menu_layer_set_highlight_colors(s_list_menu, GColorCeleste, ink());
   menu_layer_set_callbacks(s_list_menu, NULL, (MenuLayerCallbacks) {
     .get_num_rows = list_num_rows,
     .get_cell_height = list_cell_height,
@@ -916,6 +1125,7 @@ static void list_window_load(Window *window) {
   layer_set_update_proc(s_list_chrome, list_chrome_update_proc);
   layer_add_child(root, s_list_chrome);
 
+  add_activity(window, &s_list_activity);
   add_rail(window, &s_list_rail);
 }
 
@@ -926,6 +1136,8 @@ static void list_window_unload(Window *window) {
   s_list_menu = NULL;
   s_list_chrome = NULL;
   s_list_rail = NULL;
+  if (s_list_activity) layer_destroy(s_list_activity);
+  s_list_activity = NULL;
 }
 
 static void detail_window_load(Window *window) {
@@ -960,6 +1172,7 @@ static void detail_window_load(Window *window) {
   layer_set_update_proc(s_detail_chrome, detail_chrome_update_proc);
   layer_add_child(root, s_detail_chrome);
 
+  add_activity(window, &s_detail_activity);
   add_rail(window, &s_detail_rail);
   detail_resize();
 }
@@ -979,6 +1192,8 @@ static void detail_window_unload(Window *window) {
   s_detail_scroll = NULL;
   s_detail_chrome = NULL;
   s_detail_rail = NULL;
+  if (s_detail_activity) layer_destroy(s_detail_activity);
+  s_detail_activity = NULL;
 }
 
 /* A notification overlay takes the screen without unloading anything under it,
@@ -996,6 +1211,7 @@ static void minute_tick(struct tm *tick_time, TimeUnits units_changed) {
 
 static void init(void) {
   s_font_dot = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_DOT_10));
+  s_font_dot_large = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_DOT_20));
   s_font_author = fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
   s_font_preview = fonts_get_system_font(FONT_KEY_GOTHIC_14);
   s_font_body = fonts_get_system_font(FONT_KEY_GOTHIC_18);
@@ -1008,6 +1224,12 @@ static void init(void) {
   window_set_window_handlers(s_list_window, (WindowHandlers) {
     .load = list_window_load,
     .unload = list_window_unload
+  });
+
+  s_actions_window = window_create();
+  window_set_window_handlers(s_actions_window, (WindowHandlers) {
+    .load = actions_window_load,
+    .unload = actions_window_unload
   });
 
   s_detail_window = window_create();
@@ -1035,6 +1257,8 @@ static void deinit(void) {
   }
   if (s_list_window) window_destroy(s_list_window);
   if (s_detail_window) window_destroy(s_detail_window);
+  if (s_actions_window) window_destroy(s_actions_window);
+  if (s_font_dot_large) fonts_unload_custom_font(s_font_dot_large);
   if (s_font_dot) fonts_unload_custom_font(s_font_dot);
 }
 

@@ -552,7 +552,7 @@ async function main() {
   context.sendReply(0, 1, 12)
   await waitFor(() => pageChunks(12).length, "nested reply")
   assert.strictEqual(pageChunks(12)[0].page, 1)
-  assert.match(pageChunks(12)[0].body, /Nested reply \(level 2\)/)
+  assert.match(pageChunks(12)[0].body, /Nested reply L2/)
   assert.match(pageChunks(12)[0].body, /Nested café/)
   assert.strictEqual(requests.length, 1)
 

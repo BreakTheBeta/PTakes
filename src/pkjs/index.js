@@ -43,7 +43,7 @@ var CMD_STATUS = 8;
 var CMD_COMMENT_REQUEST = 9;
 var CMD_COMMENT_CHUNK = 10;
 
-var BUILD_LABEL = "v0.2";
+var BUILD_LABEL = "v0.3";
 // @generated protocol:end
 
 var GRAPHQL_URL = "https://www.lesswrong.com/graphql";
@@ -576,10 +576,10 @@ function replyPages(results, rootId) {
     if (body) {
       var author = flatten((reply.user && reply.user.displayName) || "Anonymous");
       var score = clampInt(reply.baseScore, -100000, 100000, 0);
-      var label = depth === 1 ? "Direct reply" : "Nested reply (level " + depth + ")";
+      var label = depth === 1 ? "Direct reply" : "Nested reply L" + depth;
       var age = ageText(Date.now() - Date.parse(reply.postedAt));
-      pages.push(compact(author, AUTHOR_LIMIT) + "\n" + label + "  |  " +
-        (score > 0 ? "+" : "") + score + "  |  " + age + "\n\n" + body);
+      pages.push(compact(author, AUTHOR_LIMIT) + "\n" + label + " / " +
+        (score > 0 ? "+" : "") + score + " / " + age + "\n\n" + body);
     }
     (children[reply._id] || []).forEach(function(child) { visit(child, depth + 1); });
   }
@@ -692,16 +692,17 @@ function configurationHtml() {
     "<title>PTakes</title>",
     "<style>",
     "body{font:16px -apple-system,Roboto,sans-serif;margin:0;padding:18px;",
-    "background:#11130f;color:#e8ece4}",
+    "background:#111713;color:#eef5ef}",
+    "h1, label, button{font-family:ui-monospace,monospace}",
     "h1{font-size:19px;margin:0 0 4px}",
-    "p.sub{margin:0 0 20px;color:#8f9a86;font-size:13px}",
-    "label{display:block;margin:16px 0 6px;font-size:13px;color:#8f9a86;",
+    "p.sub{margin:0 0 20px;padding-bottom:12px;border-bottom:2px dotted #72c596;color:#b0c2b4;font-size:13px}",
+    "label{display:block;margin:16px 0 6px;font-size:13px;color:#b0c2b4;",
     "text-transform:uppercase;letter-spacing:.06em}",
     "select,input{width:100%;box-sizing:border-box;padding:11px;font-size:16px;",
-    "border-radius:8px;border:1px solid #39412f;background:#1b1f17;color:#e8ece4}",
+    "border:1px solid #587264;background:#1a2620;color:#eef5ef}",
     "button{width:100%;margin-top:26px;padding:14px;font-size:16px;font-weight:600;",
-    "border:0;border-radius:8px;background:#4c8a52;color:#fff}",
-    "small{display:block;margin-top:8px;color:#6f7a67;font-size:12px}",
+    "border:2px dotted #172e22;background:#9ee4b6;color:#14241a}",
+    "small{display:block;margin-top:8px;color:#b0c2b4;font-size:12px}",
     "</style></head><body>",
     "<h1>PTakes · LessWrong Quick Takes</h1>",
     "<p class='sub'>Build " + BUILD_LABEL + "</p>",
