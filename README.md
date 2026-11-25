@@ -1,12 +1,25 @@
+<p align="center"><img src="assets/ptakes-icon.png" width="144" alt="PTakes app icon"></p>
+
 # PTakes
 
 A Pebble Time 2 watchapp that shows a random handful of the day's
 [LessWrong](https://www.lesswrong.com) Quick Takes — the site's shortform posts —
-and lets you read any of them in full on the wrist.
+and lets you read the takes and their comment threads on the wrist.
 
 The watch side is an ordinary Pebble C app. The PebbleKit JS bridge on the phone
-makes one GraphQL request to `lesswrong.com` per refresh; there is no server, no
-account and no API key.
+queries `lesswrong.com` directly. Reading takes and replies requires no account or API key.
+
+## Screenshots
+
+Pebble Time 2 captures with sample takes and replies.
+
+| Take list | Take | Direct reply | Nested reply |
+| --- | --- | --- | --- |
+| ![Take list](docs/screenshots/list.png) | ![Reading a take](docs/screenshots/take.png) | ![A direct reply with score and age](docs/screenshots/reply.png) | ![A nested reply](docs/screenshots/nested-reply.png) |
+
+| Options | Loading takes | Loading a take | Loading replies |
+| --- | --- | --- | --- |
+| ![Shuffle and refresh options](docs/screenshots/options.png) | ![Dot-matrix feed loader](docs/screenshots/loading-takes.png) | ![Dot-matrix take loader](docs/screenshots/loading-take.png) | ![Dot-matrix reply loader](docs/screenshots/loading-reply.png) |
 
 ## What it does
 
@@ -18,22 +31,26 @@ long ago it was posted, and the first two lines. SELECT opens the full text.
 The phone keeps the whole day it fetched, not just the twelve it sent. That is
 what makes **Shuffle** free — a new random sample is a re-deal from memory rather
 than a second trip to the network, and opening a take costs no request at all
-because its text is already on the phone.
+because its text is already on the phone. Opening comments fetches up to 100
+replies for that take, including nested replies. The phone caches them while
+the take remains in the pool. Each reply shows its author, nesting level,
+score and age.
 
 A day too quiet to sample from widens to three days once, rather than showing an
 empty list. The window it actually used is reported in the footer.
 
 ## Controls
 
-| Button | On the list | Reading a take |
-| --- | --- | --- |
-| UP / DOWN | Move through the takes | Scroll |
-| SELECT | Open the take | — |
-| SELECT (hold) | Shuffle / Refresh menu | — |
-| BACK | Leave the app | Back to the list |
+| Button | On the list | Reading a take | Reading replies |
+| --- | --- | --- | --- |
+| UP / DOWN | Move through the takes | Scroll | Scroll |
+| SELECT | Open the take or Options | Open comments | Next reply or retry |
+| SELECT (hold) | Shuffle / Refresh menu | — | Previous reply |
+| BACK | Leave the app | Back to the list | Back to the take |
 
-The left edge of each row is tinted by karma, so a strong one is findable
-without reading the numbers.
+The dotted gutter beside each take is tinted by karma, making scores easier
+to scan. Bitmap labels and dotted dividers carry through the reader, replies,
+and options. Long text uses a proportional font for readability.
 
 ## Settings
 
@@ -86,9 +103,9 @@ a character in half; `trim_partial_utf8()` on the watch is the safety net that
 would make a future drift show up as shortened text rather than as nothing.
 
 Nothing on either screen animates at rest. The one timer in the app runs only
-while a request is in flight, at `BUSY_TICK_MS`, and repaints the two-pixel
-accent rail under the top band rather than a panel — that rail is the progress
-indicator. The footer's sync age rides the `MINUTE_UNIT` tick the system already
+while a request is in flight, at `BUSY_TICK_MS`. It updates the two-pixel
+rail and, when a loading placeholder is visible, its small dot-matrix field.
+Both show the same center-out shutter. The footer's sync age rides the `MINUTE_UNIT` tick the system already
 runs for the clock, so it costs no wakeup of its own, and `app_focus_service`
 stops the busy timer when the app is not on the glass.
 

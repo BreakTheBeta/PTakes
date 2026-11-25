@@ -29,6 +29,8 @@ var KEY_STATUS = "status";
 var KEY_POOL = "pool";
 var KEY_WINDOW = "window";
 var KEY_KARMA = "karma";
+var KEY_PAGE = "page";
+var KEY_REQUEST_ID = "request_id";
 
 var CMD_REFRESH = 1;
 var CMD_SHUFFLE = 2;
@@ -38,8 +40,10 @@ var CMD_BODY_REQUEST = 5;
 var CMD_BODY_CHUNK = 6;
 var CMD_ERROR = 7;
 var CMD_STATUS = 8;
+var CMD_COMMENT_REQUEST = 9;
+var CMD_COMMENT_CHUNK = 10;
 
-var BUILD_LABEL = "v0.1";
+var BUILD_LABEL = "v0.3";
 // @generated protocol:end
 
 var GRAPHQL_URL = "https://www.lesswrong.com/graphql";
@@ -54,6 +58,7 @@ var FETCH_LIMIT = 60;
 // Matching that here keeps the chunk count honest instead of promising a tail
 // the server never sent.
 var BODY_LIMIT = 2000;
+var REPLY_LIMIT = 100;
 // One AppMessage per chunk, sized so a chunk plus its keys clears the watch's
 // 1024 byte inbox with room to spare.
 var BODY_CHUNK = 400;
@@ -288,7 +293,7 @@ function transportFailure(kind, elapsedMs, budgetMs) {
   return new Error("Cannot reach lesswrong.com");
 }
 
-function fetchTakes(callback) {
+function fetchComments(body, callback) {
   if (typeof XMLHttpRequest === "undefined") {
     callback(new Error("Phone HTTP unavailable"));
     return;
@@ -354,18 +359,24 @@ function fetchTakes(callback) {
     }
     var results = payload && payload.data && payload.data.comments &&
       payload.data.comments.results;
-    if (!results || typeof results.length !== "number") {
+    if (!Array.isArray(results)) {
       finish(new Error("No quick takes in reply"));
       return;
     }
-    finish(null, normalizeTakes(results));
+    finish(null, results);
   };
 
   request.open("POST", GRAPHQL_URL, true);
   request.setRequestHeader("Content-Type", "application/json");
   request.setRequestHeader("Accept", "application/json");
   request.timeout = HTTP_TIMEOUT_MS;
-  request.send(graphqlBody(FETCH_LIMIT));
+  request.send(body);
+}
+
+function fetchTakes(callback) {
+  fetchComments(graphqlBody(FETCH_LIMIT), function(error, results) {
+    callback(error, error ? null : normalizeTakes(results));
+  });
 }
 
 function normalizeTakes(results) {
@@ -490,6 +501,8 @@ function makeMessage(command, fields) {
   if (fields.status !== undefined) message[KEY_STATUS] = fields.status;
   if (fields.pool !== undefined) message[KEY_POOL] = fields.pool;
   if (fields.window !== undefined) message[KEY_WINDOW] = fields.window;
+  if (fields.page !== undefined) message[KEY_PAGE] = fields.page;
+  if (fields.requestId !== undefined) message[KEY_REQUEST_ID] = fields.requestId;
   return message;
 }
 
@@ -546,6 +559,83 @@ function sendBody(index) {
 }
 
 
+function replyPages(results, rootId) {
+  var children = Object.create(null);
+  var seen = Object.create(null);
+  var pages = [];
+  results.forEach(function(reply) {
+    if (!reply || !reply._id || reply._id === rootId) return;
+    var parent = reply.parentCommentId || rootId;
+    (children[parent] || (children[parent] = [])).push(reply);
+  });
+
+  function visit(reply, depth) {
+    if (seen[reply._id]) return;
+    seen[reply._id] = true;
+    var body = tidyBody(reply.contents && reply.contents.plaintextMainText);
+    if (body) {
+      var author = flatten((reply.user && reply.user.displayName) || "Anonymous");
+      var score = clampInt(reply.baseScore, -100000, 100000, 0);
+      var label = depth === 1 ? "Direct reply" : "Nested reply L" + depth;
+      var age = ageText(Date.now() - Date.parse(reply.postedAt));
+      pages.push(compact(author, AUTHOR_LIMIT) + "\n" + label + " / " +
+        (score > 0 ? "+" : "") + score + " / " + age + "\n\n" + body);
+    }
+    (children[reply._id] || []).forEach(function(child) { visit(child, depth + 1); });
+  }
+  (children[rootId] || []).forEach(function(reply) { visit(reply, 1); });
+  // A parent outside the response can leave a visible nested reply without a root.
+  results.forEach(function(reply) {
+    if (reply && reply._id && reply._id !== rootId && reply.parentCommentId !== rootId) visit(reply, 2);
+  });
+  return pages;
+}
+
+function sendReply(index, page, requestId) {
+  var take = sample[index];
+
+  function respond(error, replies) {
+    if (sample[index] !== take) return;
+    if (error) {
+      send(makeMessage(CMD_COMMENT_CHUNK, {
+        index: index, page: page, requestId: requestId, error: compact(error.message, ERROR_LIMIT)
+      }));
+      return;
+    }
+    var text = replies[page] || (replies.length ? "No more replies." : "No replies yet.");
+    var pieces = splitBody(compact(text, BODY_LIMIT), BODY_CHUNK);
+    pieces.forEach(function(piece) {
+      send(makeMessage(CMD_COMMENT_CHUNK, {
+        index: index, page: page, requestId: requestId, total: replies.length,
+        offset: piece.offset, chunks: pieces.length, body: piece.text
+      }));
+    });
+  }
+
+  if (!take) {
+    respond(new Error("That take is no longer loaded"));
+    return;
+  }
+  if (take.replies) {
+    respond(null, take.replies);
+    return;
+  }
+  if (take.replyCallbacks) {
+    take.replyCallbacks.push(respond);
+    return;
+  }
+  take.replyCallbacks = [respond];
+  var query = "{comments(input:{terms:{view:\"repliesToCommentThread\",topLevelCommentId:" +
+    JSON.stringify(take.id) + ",limit:" + REPLY_LIMIT +
+    "}}){results{_id parentCommentId postedAt baseScore user{displayName} contents{plaintextMainText}}}}";
+  fetchComments(JSON.stringify({ query: query }), function(error, results) {
+    var callbacks = take.replyCallbacks;
+    delete take.replyCallbacks;
+    if (!error) take.replies = replyPages(results, take.id);
+    callbacks.forEach(function(callback) { callback(error, take.replies); });
+  });
+}
+
 ////////////////////////////////////////////////////////////////////// actions
 
 function refresh() {
@@ -599,21 +689,22 @@ function configurationHtml() {
   return [
     "<!DOCTYPE html><html><head>",
     "<meta name='viewport' content='width=device-width,initial-scale=1'>",
-    "<title>Quick Takes</title>",
+    "<title>PTakes</title>",
     "<style>",
     "body{font:16px -apple-system,Roboto,sans-serif;margin:0;padding:18px;",
-    "background:#11130f;color:#e8ece4}",
+    "background:#111713;color:#eef5ef}",
+    "h1, label, button{font-family:ui-monospace,monospace}",
     "h1{font-size:19px;margin:0 0 4px}",
-    "p.sub{margin:0 0 20px;color:#8f9a86;font-size:13px}",
-    "label{display:block;margin:16px 0 6px;font-size:13px;color:#8f9a86;",
+    "p.sub{margin:0 0 20px;padding-bottom:12px;border-bottom:2px dotted #72c596;color:#b0c2b4;font-size:13px}",
+    "label{display:block;margin:16px 0 6px;font-size:13px;color:#b0c2b4;",
     "text-transform:uppercase;letter-spacing:.06em}",
     "select,input{width:100%;box-sizing:border-box;padding:11px;font-size:16px;",
-    "border-radius:8px;border:1px solid #39412f;background:#1b1f17;color:#e8ece4}",
+    "border:1px solid #587264;background:#1a2620;color:#eef5ef}",
     "button{width:100%;margin-top:26px;padding:14px;font-size:16px;font-weight:600;",
-    "border:0;border-radius:8px;background:#4c8a52;color:#fff}",
-    "small{display:block;margin-top:8px;color:#6f7a67;font-size:12px}",
+    "border:2px dotted #172e22;background:#9ee4b6;color:#14241a}",
+    "small{display:block;margin-top:8px;color:#b0c2b4;font-size:12px}",
     "</style></head><body>",
-    "<h1>LessWrong Quick Takes</h1>",
+    "<h1>PTakes · LessWrong Quick Takes</h1>",
     "<p class='sub'>Build " + BUILD_LABEL + "</p>",
     "<label for='window'>Look back</label>",
     "<select id='window'>",
@@ -670,6 +761,9 @@ Pebble.addEventListener("appmessage", function(event) {
     shuffle();
   } else if (command === CMD_BODY_REQUEST) {
     sendBody(message[KEY_INDEX] || 0);
+  } else if (command === CMD_COMMENT_REQUEST) {
+    sendReply(message[KEY_INDEX] || 0, clampInt(message[KEY_PAGE], 0, REPLY_LIMIT - 1, 0),
+              message[KEY_REQUEST_ID]);
   }
 });
 

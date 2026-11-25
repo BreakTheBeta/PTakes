@@ -533,6 +533,40 @@ async function main() {
   assert.match(html, /win\.value='168'/)
   assert.match(html, /count\.value='6'/)
 
+  // Replies are fetched on demand, then paged from the cached thread.
+  reset()
+  context.sample = context.normalizeTakes([comment({ _id: "root" })])
+  replyWith([
+    comment({ _id: "nested", parentCommentId: "direct", contents: { plaintextMainText: "Nested café." } }),
+    comment({ _id: "direct", parentCommentId: "root", contents: { plaintextMainText: "Direct reply body." } }),
+    comment({ _id: "other", parentCommentId: "root", contents: { plaintextMainText: "Other reply." } }),
+  ])
+  const pageChunks = (id) => sentMessages.filter((m) => m.cmd === 10 && m.request_id === id)
+  context.sendReply(0, 0, 11)
+  await waitFor(() => pageChunks(11).length, "first reply")
+  assert.strictEqual(pageChunks(11)[0].total, 3)
+  assert.match(pageChunks(11)[0].body, /Direct reply body/)
+  const replyQuery = JSON.parse(requests[0].body).query
+  assert.match(replyQuery, /repliesToCommentThread/)
+  assert.match(replyQuery, /topLevelCommentId:"root"/)
+  context.sendReply(0, 1, 12)
+  await waitFor(() => pageChunks(12).length, "nested reply")
+  assert.strictEqual(pageChunks(12)[0].page, 1)
+  assert.match(pageChunks(12)[0].body, /Nested reply L2/)
+  assert.match(pageChunks(12)[0].body, /Nested café/)
+  assert.strictEqual(requests.length, 1)
+
+  context.sample = context.normalizeTakes([comment({ _id: "empty" })])
+  nextReplies.push({ status: 503, body: "" })
+  context.sendReply(0, 0, 13)
+  await waitFor(() => pageChunks(13).length, "reply error")
+  assert.match(pageChunks(13)[0].error, /503/)
+  replyWith([])
+  context.sendReply(0, 0, 14)
+  await waitFor(() => pageChunks(14).length, "empty replies")
+  assert.strictEqual(pageChunks(14)[0].total, 0)
+  assert.strictEqual(pageChunks(14)[0].body, "No replies yet.")
+
   // ------------------------------------------------------------ watch link
 
   // A permanently broken AppMessage link must stop after its bounded retry set.
