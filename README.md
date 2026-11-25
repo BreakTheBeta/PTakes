@@ -2,11 +2,18 @@
 
 A Pebble Time 2 watchapp that shows a random handful of the day's
 [LessWrong](https://www.lesswrong.com) Quick Takes — the site's shortform posts —
-and lets you read any of them in full on the wrist.
+and lets you read the takes and their comment threads on the wrist.
 
 The watch side is an ordinary Pebble C app. The PebbleKit JS bridge on the phone
-makes one GraphQL request to `lesswrong.com` per refresh; there is no server, no
-account and no API key.
+queries `lesswrong.com` directly. Reading takes and replies requires no account or API key.
+
+## Screenshots
+
+Pebble Time 2 captures with sample takes and replies.
+
+| Take list | Take | Direct reply | Nested reply |
+| --- | --- | --- | --- |
+| ![Take list](docs/screenshots/list.png) | ![Reading a take](docs/screenshots/take.png) | ![A direct reply with score and age](docs/screenshots/reply.png) | ![A nested reply](docs/screenshots/nested-reply.png) |
 
 ## What it does
 
@@ -18,19 +25,22 @@ long ago it was posted, and the first two lines. SELECT opens the full text.
 The phone keeps the whole day it fetched, not just the twelve it sent. That is
 what makes **Shuffle** free — a new random sample is a re-deal from memory rather
 than a second trip to the network, and opening a take costs no request at all
-because its text is already on the phone.
+because its text is already on the phone. Opening comments fetches up to 100
+replies for that take, including nested replies. The phone caches them while
+the take remains in the pool. Each reply shows its author, nesting level,
+score and age.
 
 A day too quiet to sample from widens to three days once, rather than showing an
 empty list. The window it actually used is reported in the footer.
 
 ## Controls
 
-| Button | On the list | Reading a take |
-| --- | --- | --- |
-| UP / DOWN | Move through the takes | Scroll |
-| SELECT | Open the take | — |
-| SELECT (hold) | Shuffle / Refresh menu | — |
-| BACK | Leave the app | Back to the list |
+| Button | On the list | Reading a take | Reading replies |
+| --- | --- | --- | --- |
+| UP / DOWN | Move through the takes | Scroll | Scroll |
+| SELECT | Open the take | Open comments | Next reply or retry |
+| SELECT (hold) | Shuffle / Refresh menu | — | Previous reply |
+| BACK | Leave the app | Back to the list | Back to the take |
 
 The left edge of each row is tinted by karma, so a strong one is findable
 without reading the numbers.

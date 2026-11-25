@@ -3,7 +3,7 @@
   "shortName": "PTakes",
   "longName": "PTakes",
   "companyName": "Break the Beta",
-  "versionLabel": "0.1",
+  "versionLabel": "0.2",
   "sdkVersion": "3",
   "enableMultiJS": true,
   "targetPlatforms": [
@@ -26,7 +26,9 @@
     "status": 10,
     "pool": 11,
     "window": 12,
-    "karma": 13
+    "karma": 13,
+    "page": 14,
+    "request_id": 15
   },
   "resources": {
     "media": [
@@ -40,7 +42,7 @@
         "type": "font",
         "name": "FONT_DOT_10",
         "file": "fonts/Dot6x10-1x.ttf",
-        "characterRegex": "[ -~\u2026]"
+        "characterRegex": "[ -~…]"
       }
     ]
   },

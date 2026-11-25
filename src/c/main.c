@@ -12,31 +12,35 @@
  * test/protocol.test.js fails if the copies disagree.
  */
 /* @generated protocol:begin */
-#define KEY_CMD     0
-#define KEY_INDEX   1
-#define KEY_TOTAL   2
-#define KEY_AUTHOR  3
-#define KEY_AGE     4
-#define KEY_PREVIEW 5
-#define KEY_BODY    6
-#define KEY_OFFSET  7
-#define KEY_CHUNKS  8
-#define KEY_ERROR   9
-#define KEY_STATUS  10
-#define KEY_POOL    11
-#define KEY_WINDOW  12
-#define KEY_KARMA   13
+#define KEY_CMD        0
+#define KEY_INDEX      1
+#define KEY_TOTAL      2
+#define KEY_AUTHOR     3
+#define KEY_AGE        4
+#define KEY_PREVIEW    5
+#define KEY_BODY       6
+#define KEY_OFFSET     7
+#define KEY_CHUNKS     8
+#define KEY_ERROR      9
+#define KEY_STATUS     10
+#define KEY_POOL       11
+#define KEY_WINDOW     12
+#define KEY_KARMA      13
+#define KEY_PAGE       14
+#define KEY_REQUEST_ID 15
 
-#define CMD_REFRESH      1
-#define CMD_SHUFFLE      2
-#define CMD_TAKE_ITEM    3
-#define CMD_TAKE_END     4
-#define CMD_BODY_REQUEST 5
-#define CMD_BODY_CHUNK   6
-#define CMD_ERROR        7
-#define CMD_STATUS       8
+#define CMD_REFRESH         1
+#define CMD_SHUFFLE         2
+#define CMD_TAKE_ITEM       3
+#define CMD_TAKE_END        4
+#define CMD_BODY_REQUEST    5
+#define CMD_BODY_CHUNK      6
+#define CMD_ERROR           7
+#define CMD_STATUS          8
+#define CMD_COMMENT_REQUEST 9
+#define CMD_COMMENT_CHUNK   10
 
-#define BUILD_LABEL "v0.1"
+#define BUILD_LABEL "v0.2"
 /* @generated protocol:end */
 
 /* Pebble Time 2 (emery): 200 x 228. The chrome takes 18 top and 18 bottom and
@@ -61,6 +65,7 @@
 #define BODY_PAD 8
 
 #define MAX_TAKES 20
+#define MAX_REPLIES 100
 /* One over each bridge limit, for the terminator. test/protocol.test.js checks
    these against the phone's truncation so a field cannot arrive already too
    long to store. */
@@ -112,6 +117,11 @@ static int s_selected;
 static char s_body[BODY_MAX];
 /* Which take s_body holds, so reopening the one you just read costs nothing. */
 static int s_body_index = -1;
+static int s_comment_page = -1;
+static int s_comment_count;
+static uint32_t s_comment_request;
+static bool s_restore_take_offset;
+static GPoint s_take_offset;
 static int s_body_chunks;
 static int s_body_received;
 static int s_body_len;
@@ -128,6 +138,7 @@ static bool s_listed_once;
 
 static void update_busy_timer(void);
 static void request_body(int index);
+static void detail_resize(void);
 
 
 ///////////////////////////////////////////////////////////////////// palette
@@ -341,7 +352,7 @@ static void list_chrome_update_proc(Layer *layer, GContext *ctx) {
     snprintf(position, sizeof(position), "%d/%d",
              clamp_int(s_selected + 1, 1, MAX_TAKES), clamp_int(s_take_count, 1, MAX_TAKES));
   }
-  draw_band(ctx, GRect(0, 0, bounds.size.w, BAND_HEIGHT), "QUICK TAKES", position);
+  draw_band(ctx, GRect(0, 0, bounds.size.w, BAND_HEIGHT), "PTAKES", position);
 
   char left[24] = "";
   if (s_error[0] && s_take_count > 0) {
@@ -435,17 +446,21 @@ static void list_selection_changed(MenuLayer *menu_layer, MenuIndex new_index,
   }
 }
 
-static void send_command(int command, int index) {
+static bool send_command(int command, int index) {
   DictionaryIterator *iter;
   if (app_message_outbox_begin(&iter) != APP_MSG_OK) {
-    return;
+    return false;
   }
   dict_write_uint8(iter, KEY_CMD, command);
   if (index >= 0) {
     dict_write_uint8(iter, KEY_INDEX, (uint8_t)index);
   }
+  if (command == CMD_COMMENT_REQUEST) {
+    dict_write_uint8(iter, KEY_PAGE, (uint8_t)s_comment_page);
+    dict_write_uint32(iter, KEY_REQUEST_ID, s_comment_request);
+  }
   dict_write_end(iter);
-  app_message_outbox_send();
+  return app_message_outbox_send() == APP_MSG_OK;
 }
 
 static void request_refresh(void) {
@@ -470,6 +485,7 @@ static void list_select(MenuLayer *menu_layer, MenuIndex *index, void *data) {
     request_refresh();
     return;
   }
+  s_restore_take_offset = false;
   request_body(index->row);
   window_stack_push(s_detail_window, true);
 }
@@ -537,7 +553,7 @@ static const char *detail_text(void) {
     return s_error;
   }
   if (!detail_ready()) {
-    return "Loading…";
+    return s_comment_page >= 0 ? "Reading replies…" : "Loading…";
   }
   return s_body;
 }
@@ -554,7 +570,7 @@ static void detail_resize(void) {
     return;
   }
   GRect frame = layer_get_frame(scroll_layer_get_layer(s_detail_scroll));
-  int height = detail_content_height(frame.size.w);
+  int height = clamp_int(detail_content_height(frame.size.w), frame.size.h, 4000);
   layer_set_frame(s_detail_body, GRect(0, 0, frame.size.w, height));
   scroll_layer_set_content_size(s_detail_scroll, GSize(frame.size.w, height));
   layer_mark_dirty(s_detail_body);
@@ -583,28 +599,98 @@ static void detail_chrome_update_proc(Layer *layer, GContext *ctx) {
     karma_text(karma, sizeof(karma), take->karma);
     snprintf(right, sizeof(right), "%s / %s", karma, take->age);
   }
-  draw_band(ctx, GRect(0, 0, bounds.size.w, BAND_HEIGHT),
-            take ? take->author : "QUICK TAKE", right);
+  const char *title = take ? take->author : "QUICK TAKE";
+  const char *action = "SELECT COMMENTS";
+  const char *back = "";
+  if (s_comment_page >= 0) {
+    title = "REPLIES";
+    if (s_comment_count > 0) {
+      snprintf(right, sizeof(right), "%d/%d", clamp_int(s_comment_page + 1, 1, MAX_REPLIES),
+               clamp_int(s_comment_count, 1, MAX_REPLIES));
+    } else {
+      right[0] = '\0';
+    }
+    if (s_error[0]) {
+      action = "SELECT RETRY";
+    } else if (s_comment_page + 1 < s_comment_count) {
+      action = s_comment_page > 0 ? "NEXT / HOLD PREV" : "SELECT NEXT";
+    } else {
+      action = s_comment_page > 0 ? "HOLD PREV" : "";
+    }
+    back = "BACK TAKE";
+  }
+  draw_band(ctx, GRect(0, 0, bounds.size.w, BAND_HEIGHT), title, right);
+  draw_band(ctx, GRect(0, bounds.size.h - BAND_HEIGHT, bounds.size.w, BAND_HEIGHT), action, back);
 }
 
-static void request_body(int index) {
+static void request_detail_page(int index, int page) {
   index = clamp_int(index, 0, MAX_TAKES - 1);
-  if (s_body_index == index && detail_ready()) {
-    /* Already in hand from the last time it was opened. */
+  if (page < 0 && s_comment_page < 0 && s_body_index == index && detail_ready()) {
     detail_resize();
     return;
   }
   s_error[0] = '\0';
   s_body_index = index;
+  s_comment_page = page;
+  if (page <= 0) {
+    s_comment_count = 0;
+  }
   s_body_chunks = 0;
   s_body_received = 0;
   s_body_len = 0;
   memset(s_body, 0, sizeof(s_body));
+  if (page >= 0) {
+    s_comment_request++;
+  }
   set_busy(BUSY_BODY, true);
-  send_command(CMD_BODY_REQUEST, index);
+  if (!send_command(page >= 0 ? CMD_COMMENT_REQUEST : CMD_BODY_REQUEST, index)) {
+    copy_text(s_error, sizeof(s_error), "Phone not reachable");
+    set_busy(BUSY_BODY, false);
+  }
   detail_resize();
+  if (s_detail_scroll) {
+    scroll_layer_set_content_offset(s_detail_scroll, GPoint(0, 0), false);
+  }
 }
 
+static void request_body(int index) {
+  request_detail_page(index, -1);
+}
+
+static void detail_select(ClickRecognizerRef recognizer, void *context) {
+  if (s_body_index < 0 || (s_busy & BUSY_BODY)) {
+    return;
+  }
+  if (s_comment_page < 0) {
+    s_take_offset = scroll_layer_get_content_offset(s_detail_scroll);
+    request_detail_page(s_body_index, 0);
+  } else if (s_error[0]) {
+    request_detail_page(s_body_index, s_comment_page);
+  } else if (s_comment_page + 1 < s_comment_count) {
+    request_detail_page(s_body_index, s_comment_page + 1);
+  }
+}
+
+static void detail_previous(ClickRecognizerRef recognizer, void *context) {
+  if (s_comment_page > 0 && !(s_busy & BUSY_BODY)) {
+    request_detail_page(s_body_index, s_comment_page - 1);
+  }
+}
+
+static void detail_back(ClickRecognizerRef recognizer, void *context) {
+  if (s_comment_page >= 0 && s_body_index >= 0) {
+    s_restore_take_offset = true;
+    request_body(s_body_index);
+  } else {
+    window_stack_pop(true);
+  }
+}
+
+static void detail_click_config(void *context) {
+  window_single_click_subscribe(BUTTON_ID_SELECT, detail_select);
+  window_long_click_subscribe(BUTTON_ID_SELECT, 0, detail_previous, NULL);
+  window_single_click_subscribe(BUTTON_ID_BACK, detail_back);
+}
 
 ///////////////////////////////////////////////////////////////// app message
 
@@ -628,7 +714,28 @@ static void store_take(DictionaryIterator *iter) {
   take->karma = karma ? clamp_int(karma->value->int32, -KARMA_MAX, KARMA_MAX) : 0;
 }
 
-static void store_body_chunk(DictionaryIterator *iter) {
+static void store_body_chunk(DictionaryIterator *iter, bool comment) {
+  if (comment != (s_comment_page >= 0)) {
+    return;
+  }
+  if (comment) {
+    Tuple *request = dict_find(iter, KEY_REQUEST_ID);
+    Tuple *page = dict_find(iter, KEY_PAGE);
+    Tuple *index = dict_find(iter, KEY_INDEX);
+    if (!request || !page || !index || request->value->uint32 != s_comment_request ||
+        page->value->int32 != s_comment_page || index->value->int32 != s_body_index) {
+      return;
+    }
+    Tuple *error = dict_find(iter, KEY_ERROR);
+    if (error) {
+      copy_text(s_error, sizeof(s_error), error->value->cstring);
+      set_busy(BUSY_BODY, false);
+      detail_resize();
+      return;
+    }
+    Tuple *total = dict_find(iter, KEY_TOTAL);
+    if (total) s_comment_count = clamp_int(total->value->int32, 0, MAX_REPLIES);
+  }
   Tuple *index_tuple = dict_find(iter, KEY_INDEX);
   Tuple *offset_tuple = dict_find(iter, KEY_OFFSET);
   Tuple *chunks_tuple = dict_find(iter, KEY_CHUNKS);
@@ -666,10 +773,15 @@ static void store_body_chunk(DictionaryIterator *iter) {
   s_body_chunks = chunks;
   s_body_received++;
 
-  if (detail_ready()) {
+  bool ready = detail_ready();
+  if (ready) {
     set_busy(BUSY_BODY, false);
   }
   detail_resize();
+  if (ready && !comment && s_restore_take_offset && s_detail_scroll) {
+    scroll_layer_set_content_offset(s_detail_scroll, s_take_offset, false);
+    s_restore_take_offset = false;
+  }
 }
 
 static void finish_list(DictionaryIterator *iter) {
@@ -688,6 +800,9 @@ static void finish_list(DictionaryIterator *iter) {
   /* The sample changed underneath whatever was cached, so the index it was
      keyed on no longer means the same take. */
   s_body_index = -1;
+  s_comment_page = -1;
+  s_restore_take_offset = false;
+  set_busy(BUSY_BODY, false);
   s_body_chunks = 0;
   s_body_received = 0;
   s_body_len = 0;
@@ -716,7 +831,10 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
       finish_list(iter);
       break;
     case CMD_BODY_CHUNK:
-      store_body_chunk(iter);
+      store_body_chunk(iter, false);
+      break;
+    case CMD_COMMENT_CHUNK:
+      store_body_chunk(iter, true);
       break;
     case CMD_STATUS: {
       Tuple *status = dict_find(iter, KEY_STATUS);
@@ -816,11 +934,14 @@ static void detail_window_load(Window *window) {
   window_set_background_color(window, chassis());
 
   GRect glass = GRect(PANEL_INSET, TOP_CHROME, bounds.size.w - 2 * PANEL_INSET,
-                      bounds.size.h - TOP_CHROME - PANEL_INSET);
+                      bounds.size.h - TOP_CHROME - BAND_HEIGHT);
   s_detail_scroll = scroll_layer_create(glass);
   if (!s_detail_scroll) {
     return;
   }
+  scroll_layer_set_callbacks(s_detail_scroll, (ScrollLayerCallbacks) {
+    .click_config_provider = detail_click_config
+  });
   scroll_layer_set_click_config_onto_window(s_detail_scroll, window);
   scroll_layer_set_shadow_hidden(s_detail_scroll, true);
   layer_add_child(root, scroll_layer_get_layer(s_detail_scroll));
@@ -832,7 +953,7 @@ static void detail_window_load(Window *window) {
   layer_set_update_proc(s_detail_body, detail_body_update_proc);
   scroll_layer_add_child(s_detail_scroll, s_detail_body);
 
-  s_detail_chrome = layer_create(GRect(0, 0, bounds.size.w, BAND_HEIGHT));
+  s_detail_chrome = layer_create(bounds);
   if (!s_detail_chrome) {
     return;
   }
